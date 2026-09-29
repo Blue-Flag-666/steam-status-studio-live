@@ -389,10 +389,9 @@ export function createStatusController({ apps, appStore, storage, runner, sleep 
       // advertised as running after we report that Apply failed.
       try {
         ownedOverview(record);
-        if (running(record.id)) {
-          await apps.TerminateApp(gameIdFromAppId(record.id), false);
-          await waitFor(() => !running(record.id), 'Steam 未确认专用状态条目已停止。');
-        }
+        // Steam can launch the runner before its overview reports RUNNING.
+        // Retire that process too, even when Steam still reports stopped.
+        await stopOwned(record);
       } catch (cleanupError) {
         throw new Error(`${error instanceof Error ? error.message : String(error)}；自动停止专用条目失败：${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`);
       }

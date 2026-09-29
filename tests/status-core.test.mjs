@@ -275,6 +275,18 @@ test('a partially successful RunGame failure stops only the owned shortcut', asy
   assert.equal(f.records.get('123').id, f.id);
 });
 
+test('failed launch stops an orphan runner even if Steam never reports the shortcut running', async () => {
+  const f = fake();
+  f.apps.RunGame = async (gameId) => {
+    f.calls.push(['run', gameId]);
+    f.setRunnerActive(true);
+    throw new Error('Steam launch failed');
+  };
+  await assert.rejects(f.controller.apply(f.input), /Steam launch failed/);
+  assert.deepEqual(f.calls.slice(-2), [['run', gameIdFromAppId(f.id)], ['stop-runner']]);
+  assert.equal(f.overviews.get(f.id).local_per_client_data.display_status, 9);
+});
+
 test('failed launch cleanup reports the remaining running shortcut', async () => {
   const f = fake();
   f.runner.isActive = async () => false;
