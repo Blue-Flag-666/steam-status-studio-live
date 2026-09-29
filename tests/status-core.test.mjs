@@ -1,6 +1,95 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { changeTemplates, createStatusController, gameIdFromAppId, resetPluginState, validateStatus } from '../src/status-core.mjs';
+import { changeTemplates, createStatusController, gameIdFromAppId, hasUnsavedTemplateEdit, initialStatusText, loadProfileAvatar, mergeManualCleanup, parseSteamMiniProfile, resetPluginState, staticAvatarFallback, validateStatus } from '../src/status-core.mjs';
+
+test('Steam miniprofile provides animated avatar, frame, static fallback and nickname', () => {
+  const data = JSON.stringify({
+    persona_name: 'Blue-Flag',
+    avatar_url: 'https://avatars.fastly.steamstatic.com/avatar_full.jpg',
+    animated_avatar: 'https://shared.fastly.steamstatic.com/community_assets/images/items/1/animated.gif',
+    avatar_frame: 'https://shared.fastly.steamstatic.com/community_assets/images/items/2/frame.png'
+  });
+  assert.deepEqual(parseSteamMiniProfile(data), {
+    avatarUrl: 'https://shared.fastly.steamstatic.com/community_assets/images/items/1/animated.gif',
+    avatarReducedUrl: 'https://avatars.fastly.steamstatic.com/avatar_full.jpg',
+    frameUrl: 'https://shared.fastly.steamstatic.com/community_assets/images/items/2/frame.png',
+    frameReducedUrl: '', personaName: 'Blue-Flag'
+  });
+  assert.equal(parseSteamMiniProfile('{invalid'), null);
+  assert.equal(parseSteamMiniProfile(JSON.stringify({ avatar_url: 'javascript:alert(1)' })), null);
+  assert.equal(parseSteamMiniProfile(JSON.stringify({ animated_avatar: 'https://evil.example/avatar.gif' })), null);
+});
+
+test('broken animated avatar falls back to miniprofile static image once', () => {
+  const assets = parseSteamMiniProfile(JSON.stringify({
+    animated_avatar: 'https://shared.fastly.steamstatic.com/animated.gif',
+    avatar_url: 'https://avatars.fastly.steamstatic.com/static.jpg',
+    avatar_frame: 'https://shared.fastly.steamstatic.com/frame.png'
+  }));
+  const fallback = staticAvatarFallback(assets);
+  assert.equal(fallback.avatarUrl, 'https://avatars.fastly.steamstatic.com/static.jpg');
+  assert.equal(fallback.avatarReducedUrl, '');
+  assert.equal(fallback.frameUrl, assets.frameUrl);
+  assert.equal(staticAvatarFallback(fallback), null);
+});
+
+test('startup text uses this account’s last applied name, then the selected template', () => {
+  const config = { SelectedProfile: 'second', Profiles: [{ Id: 'first', Text: '模板一' }, { Id: 'second', Text: '模板二' }] };
+  const records = { '123': { name: '上次状态' }, '456': { name: '其他账号状态' } };
+  assert.equal(initialStatusText(config, records, 123), '上次状态');
+  assert.equal(initialStatusText(config, records, 789), '模板二');
+  assert.equal(initialStatusText(config, { '123': { name: 42 } }, 123), '模板二');
+  assert.equal(initialStatusText(config, { '123': { name: 'x'.repeat(81) } }, 123), '模板二');
+});
+
+test('restored last status does not count as an unsaved template edit', () => {
+  assert.equal(hasUnsavedTemplateEdit('上次状态', '上次状态', '当前模板'), false);
+  assert.equal(hasUnsavedTemplateEdit('新输入', '上次状态', '当前模板'), true);
+  assert.equal(hasUnsavedTemplateEdit('当前模板', '上次状态', '当前模板'), false);
+});
+
+test('avatar loading prefers direct miniprofile and falls back only to backend miniprofile', async () => {
+  const data = JSON.stringify({ animated_avatar: 'https://shared.fastly.steamstatic.com/animated.gif' });
+  const calls = [];
+  const direct = await loadProfileAvatar({
+    directMini: async () => { calls.push('direct'); return data; },
+    backendMini: async () => { calls.push('backend'); return data; }
+  });
+  assert.deepEqual(calls, ['direct']);
+  assert.ok(direct.assets?.avatarUrl.endsWith('/animated.gif'));
+  const failed = await loadProfileAvatar({
+    directMini: async () => { calls.push('direct-fail'); throw new Error('CORS'); },
+    backendMini: async () => { calls.push('backend-fail'); throw new Error('Timeout'); }
+  });
+  assert.equal(failed.assets, null);
+  assert.deepEqual(calls.slice(1), ['direct-fail', 'backend-fail']);
+  assert.match(failed.failures.join(' '), /CORS.*Timeout/);
+});
+
+test('invalid direct data can still use the backend miniprofile', async () => {
+  const json = JSON.stringify({ avatar_url: 'https://avatars.fastly.steamstatic.com/avatar.jpg' });
+  const result = await loadProfileAvatar({
+    directMini: async () => '{}', backendMini: async () => json
+  });
+  assert.equal(result.assets?.avatarUrl, 'https://avatars.fastly.steamstatic.com/avatar.jpg');
+});
+
+test('slow direct avatar request can be overtaken by a fast backend fallback', async () => {
+  const calls = [];
+  let releaseDirect;
+  const direct = new Promise((resolve) => { releaseDirect = resolve; });
+  const result = await loadProfileAvatar({
+    directMini: () => { calls.push('direct'); return direct; },
+    backendMini: () => {
+      calls.push('backend');
+      return JSON.stringify({ avatar_url: 'https://avatars.fastly.steamstatic.com/fallback.jpg' });
+    },
+    hedgeDelayMs: 0
+  });
+  assert.deepEqual(calls, ['direct', 'backend']);
+  assert.equal(result.assets.avatarUrl, 'https://avatars.fastly.steamstatic.com/fallback.jpg');
+  releaseDirect('{}');
+});
 
 function fake() {
   const calls = [];
@@ -55,35 +144,21 @@ test('reapplying the same running status keeps the runner and shortcut untouched
   assert.equal(f.records.get('123').runner, true);
 });
 
-test('experimental rename keeps the runner, and ordinary apply can force a verified refresh', async () => {
+test('legacy rename-only record gets one verified refresh, then same-name apply is a no-op', async () => {
   const f = fake();
   await f.controller.apply(f.input);
+  f.records.set('123', { ...f.records.get('123'), needsRefresh: true });
   const before = f.calls.length;
-  await f.controller.renameOnly({ accountId: '123', text: '听音乐 🎵' });
-  assert.deepEqual(f.calls.slice(before), [['rename', f.id, '听音乐 🎵']]);
-  assert.equal(f.records.get('123').needsRefresh, true);
-  assert.equal(f.overviews.get(f.id).local_per_client_data.display_status, 4);
-  await f.controller.apply({ ...f.input, text: '听音乐 🎵' });
-  assert.deepEqual(f.calls.slice(before + 1), [
+  await f.controller.apply(f.input);
+  assert.deepEqual(f.calls.slice(before), [
     ['stop-runner'], ['stop', gameIdFromAppId(f.id)],
     ['exe', f.id, 'SteamStatusRunner.exe'], ['dir', f.id, 'runner'],
     ['options', f.id, ''], ['run', gameIdFromAppId(f.id)]
   ]);
-  assert.equal(f.records.get('123').needsRefresh, false);
-});
-
-test('experimental rename refuses a stopped shortcut and rolls back on storage failure', async () => {
-  const f = fake();
+  assert.equal(f.records.get('123').needsRefresh, undefined);
+  const after = f.calls.length;
   await f.controller.apply(f.input);
-  f.overviews.get(f.id).local_per_client_data.display_status = 9;
-  await assert.rejects(f.controller.renameOnly({ accountId: '123', text: '新状态' }), /尚未运行/);
-  assert.equal(f.calls.some(([operation]) => operation === 'rename'), false);
-  f.overviews.get(f.id).local_per_client_data.display_status = 4;
-  f.storage.set = async () => { throw new Error('disk full'); };
-  await assert.rejects(f.controller.renameOnly({ accountId: '123', text: '新状态' }), /disk full/);
-  assert.equal(f.overviews.get(f.id).display_name, '阅读中');
-  assert.equal(f.records.get('123').name, '阅读中');
-  assert.equal(f.calls.some(([operation]) => operation === 'stop'), false);
+  assert.equal(f.calls.length, after);
 });
 
 test('reapplying the same stopped status starts it again', async () => {
@@ -133,6 +208,18 @@ test('stop and remove touch only the recorded shortcut', async () => {
   assert.equal(f.records.has('123'), false);
 });
 
+test('an out-of-range saved shortcut ID never reaches Steam APIs', async () => {
+  const f = fake();
+  const invalidId = 4294967296;
+  f.records.set('123', { id: invalidId, name: '阅读中', runner: true });
+  f.overviews.set(invalidId, { app_type: 1073741824, display_name: '阅读中', local_per_client_data: { display_status: 4 } });
+  await assert.rejects(f.controller.apply(f.input), /记录损坏/);
+  await assert.rejects(f.controller.stop('123'), /记录损坏/);
+  await assert.rejects(f.controller.remove('123'), /记录损坏/);
+  assert.deepEqual(f.calls, []);
+  assert.equal(f.records.has('123'), true);
+});
+
 test('stop requests a graceful runner exit before terminating the Steam shortcut', async () => {
   const f = fake();
   await f.controller.apply(f.input);
@@ -167,9 +254,34 @@ test('stop also cleans an orphan runner when Steam already reports stopped', asy
 
 test('a missing runner heartbeat prevents a false successful launch', async () => {
   const f = fake();
+  f.overviews.set(123456, { app_type: 1, display_name: 'Other game', local_per_client_data: { display_status: 4 } });
   f.runner.isActive = async () => false;
   await assert.rejects(f.controller.apply(f.input), /运行程序未能启动/);
   assert.equal(f.calls.filter(([operation]) => operation === 'run').length, 1);
+  assert.deepEqual(f.calls.slice(-1), [['stop', gameIdFromAppId(f.id)]]);
+  assert.equal(f.overviews.get(f.id).local_per_client_data.display_status, 9);
+  assert.equal(f.overviews.get(123456).local_per_client_data.display_status, 4);
+});
+
+test('a partially successful RunGame failure stops only the owned shortcut', async () => {
+  const f = fake();
+  f.apps.RunGame = async (gameId) => {
+    f.calls.push(['run', gameId]);
+    f.overviews.get(f.id).local_per_client_data.display_status = 4;
+    throw new Error('Steam launch failed');
+  };
+  await assert.rejects(f.controller.apply(f.input), /Steam launch failed/);
+  assert.deepEqual(f.calls.slice(-2), [['run', gameIdFromAppId(f.id)], ['stop', gameIdFromAppId(f.id)]]);
+  assert.equal(f.records.get('123').id, f.id);
+});
+
+test('failed launch cleanup reports the remaining running shortcut', async () => {
+  const f = fake();
+  f.runner.isActive = async () => false;
+  f.apps.TerminateApp = async () => { throw new Error('Steam refused termination'); };
+  await assert.rejects(f.controller.apply(f.input), /自动停止专用条目失败：Steam refused termination/);
+  assert.equal(f.overviews.get(f.id).local_per_client_data.display_status, 4);
+  assert.equal(f.records.get('123').id, f.id);
 });
 
 test('failed runner exit prevents rename and relaunch', async () => {
@@ -243,6 +355,28 @@ test('a slow Steam overview keeps the new ID so retry cannot duplicate it', asyn
   assert.deepEqual(f.calls, [['add', '阅读中']]);
 });
 
+test('a second controller reads the shared record instead of creating another shortcut', async () => {
+  const f = fake();
+  const second = createStatusController({
+    apps: f.apps, appStore: { GetAppOverviewByAppID: (id) => f.overviews.get(id) },
+    storage: f.storage, runner: f.runner, sleep: async () => {}
+  });
+  await f.controller.apply(f.input);
+  await second.apply(f.input);
+  assert.equal(f.calls.filter(([operation]) => operation === 'add').length, 1);
+});
+
+test('a competing shortcut record is preserved when the new ID cannot be claimed', async () => {
+  const f = fake();
+  f.storage.set = async (account) => {
+    f.records.set(account, { id: 3600000000, name: '另一窗口的状态', runner: true });
+    throw new Error('A different shortcut is already recorded for this account');
+  };
+  await assert.rejects(f.controller.apply(f.input), /different shortcut/);
+  assert.equal(f.records.get('123').id, 3600000000);
+  assert.deepEqual(f.calls, [['add', '阅读中'], ['remove', f.id]]);
+});
+
 test('a failed record write removes the newly-created shortcut', async () => {
   const f = fake();
   f.storage.set = async () => { throw new Error('disk full'); };
@@ -288,8 +422,29 @@ test('new and deleted templates select the expected entry', () => {
   assert.equal(changeTemplates(deleted, { type: 'delete', id: 'c' }).SelectedProfile, 'a');
   assert.throws(() => changeTemplates({ Profiles: [{ Id: 'a', Text: '阅读' }] }, { type: 'delete', id: 'a' }), /至少保留/);
   assert.throws(() => changeTemplates(config, { type: 'add', id: 'a', text: '重复' }), /ID/);
+  assert.throws(() => changeTemplates(config, { type: 'add', id: 'c', text: ' 阅读 ' }), /相同文字/);
+  assert.throws(() => changeTemplates(config, { type: 'save', id: 'a', text: '听音乐' }), /相同文字/);
   assert.throws(() => changeTemplates(config, { type: 'save', id: 'a', text: 'x'.repeat(81) }), /80/);
   assert.throws(() => changeTemplates({ Profiles: Array.from({ length: 100 }, (_, i) => ({ Id: String(i), Text: '状态' })) }, { type: 'add', id: 'new', text: '新状态' }), /100/);
+});
+
+test('manual cleanup reports survive later resets without accumulating duplicates', () => {
+  const old = { account: '123', id: 3500000000, name: '旧状态', reason: 'Steam refused' };
+  const updated = { ...old, reason: '请手动移除' };
+  const other = { account: '456', id: 3600000000, reason: '请切换账号' };
+  assert.deepEqual(mergeManualCleanup([old], [updated, other]), [updated, other]);
+  assert.deepEqual(mergeManualCleanup([old], []), [old]);
+  assert.deepEqual(mergeManualCleanup({}, [{ account: '123', id: null, name: null, reason: null }]), [
+    { account: '123', reason: '原因未知，请检查 Steam 库' }
+  ]);
+  assert.deepEqual(mergeManualCleanup([], [{ account: '123', id: 3500000000, name: '状态', reason: '请手动删除' }]), [
+    { account: '123', reason: '请手动删除', id: 3500000000, name: '状态' }
+  ]);
+  const [unicode] = mergeManualCleanup([], [{ account: '123', name: '状态😀'.repeat(200), reason: '请手动检查😀'.repeat(200) }]);
+  assert.ok(Buffer.byteLength(unicode.name, 'utf8') <= 400);
+  assert.ok(Buffer.byteLength(unicode.reason, 'utf8') <= 500);
+  assert.ok(!unicode.name.includes('\ufffd'));
+  assert.ok(!unicode.reason.includes('\ufffd'));
 });
 
 test('full reset removes only the current account shortcut before clearing plugin data', async () => {
@@ -299,10 +454,11 @@ test('full reset removes only the current account shortcut before clearing plugi
     records: { '123': { id: 3500000000, name: '我的状态' }, '456': { id: 3600000000, name: '另一账号' } },
     removeOwned: async (account) => { calls.push(['remove', account]); },
     stopRunner: async () => { calls.push(['stop-runner']); },
-    resetData: async () => { calls.push(['reset-data']); return { config: { Profiles: [] }, shortcutIds: {} }; }
+    resetData: async (manual) => { calls.push(['reset-data', manual]); return { config: { Profiles: [] }, shortcutIds: {} }; }
   });
-  assert.deepEqual(calls, [['remove', '123'], ['stop-runner'], ['reset-data']]);
-  assert.deepEqual(result.manual, [{ account: '456', id: 3600000000, name: '另一账号', reason: '请切换到此账号后手动删除' }]);
+  const expectedManual = [{ account: '456', id: 3600000000, name: '另一账号', reason: '请切换到此账号后手动删除' }];
+  assert.deepEqual(calls, [['remove', '123'], ['stop-runner'], ['reset-data', expectedManual]]);
+  assert.deepEqual(result.manual, expectedManual);
 });
 
 test('full reset still clears plugin data and reports manual cleanup when shortcut deletion fails', async () => {

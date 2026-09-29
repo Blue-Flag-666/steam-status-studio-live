@@ -10,12 +10,15 @@ using System.Windows.Forms;
 internal static class SteamStatusRunner
 {
     [STAThread]
-    private static void Main()
+    private static void Main(string[] args)
     {
         string executable;
         using (var current = Process.GetCurrentProcess())
             executable = Path.GetFullPath(current.MainModule.FileName);
+        Process steam;
+        if (!TryGetWatchProcess(args, out steam)) return;
         string channel = GetChannel(executable);
+        using (steam)
         using (var gate = new Mutex(false, @"Local\SteamStatusStudioLive.Mutex." + channel))
         using (var exitSignal = new EventWaitHandle(false, EventResetMode.AutoReset, @"Local\SteamStatusStudioLive.Exit." + channel))
         {
@@ -36,13 +39,49 @@ internal static class SteamStatusRunner
                 // Only retire older copies of this exact executable in this session.
                 exitSignal.WaitOne(0);
                 if (!CloseLegacyInstances(executable)) return;
-                RunTray(exitSignal, Path.GetDirectoryName(executable));
+                RunTray(exitSignal, Path.GetDirectoryName(executable), steam);
             }
             finally
             {
                 if (ownsGate) gate.ReleaseMutex();
             }
         }
+    }
+
+    private static bool TryGetWatchProcess(string[] args, out Process watched)
+    {
+        watched = null;
+        // Tests may exercise tray and heartbeat behavior without Steam.
+        if (args.Length == 1 && args[0] == "--no-steam-watch") return true;
+        if (args.Length == 2 && args[0] == "--watch-pid")
+        {
+            int pid;
+            if (!int.TryParse(args[1], out pid) || pid <= 0) return false;
+            try { watched = Process.GetProcessById(pid); return !watched.HasExited; }
+            catch { if (watched != null) watched.Dispose(); watched = null; return false; }
+        }
+        if (args.Length != 0) return false;
+        using (var current = Process.GetCurrentProcess())
+        {
+            try
+            {
+                foreach (var candidate in Process.GetProcessesByName("steam"))
+                {
+                    try
+                    {
+                        if (candidate.SessionId == current.SessionId && !candidate.HasExited && watched == null)
+                        {
+                            watched = candidate;
+                            continue;
+                        }
+                    }
+                    catch { /* Ignore an inaccessible process from another session. */ }
+                    candidate.Dispose();
+                }
+            }
+            catch { if (watched != null) watched.Dispose(); watched = null; }
+        }
+        return watched != null;
     }
 
     private static string GetChannel(string executable)
@@ -80,7 +119,7 @@ internal static class SteamStatusRunner
         return true;
     }
 
-    private static void RunTray(EventWaitHandle exitSignal, string directory)
+    private static void RunTray(EventWaitHandle exitSignal, string directory, Process steam)
     {
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
@@ -110,7 +149,10 @@ internal static class SteamStatusRunner
             DateTime lastHeartbeat = DateTime.UtcNow;
             EventHandler tick = (sender, args) =>
             {
-                if (exitSignal.WaitOne(0) || File.Exists(stopRequest))
+                bool steamExited = false;
+                try { steamExited = steam != null && steam.HasExited; }
+                catch { steamExited = true; }
+                if (steamExited || exitSignal.WaitOne(0) || File.Exists(stopRequest))
                 {
                     try { File.Delete(stopRequest); } catch { }
                     context.ExitThread();

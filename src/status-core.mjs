@@ -1,6 +1,90 @@
 const SHORTCUT_FLAG = 1073741824;
 const RUNNING = 4;
 
+function safeSteamImageUrl(value) {
+  if (typeof value !== 'string') return '';
+  try {
+    const url = new URL(value.trim());
+    if (url.protocol !== 'https:' || !(
+      url.hostname === 'steamstatic.com' || url.hostname.endsWith('.steamstatic.com') ||
+      url.hostname === 'steamcdn-a.akamaihd.net'
+    )) return '';
+    return url.href;
+  } catch { return ''; }
+}
+
+export function parseSteamMiniProfile(json) {
+  if (typeof json !== 'string' || json.length > 20000) return null;
+  let data;
+  try { data = JSON.parse(json); } catch { return null; }
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
+  const animated = safeSteamImageUrl(data.animated_avatar);
+  const staticAvatar = safeSteamImageUrl(data.avatar_url);
+  const frame = safeSteamImageUrl(data.avatar_frame);
+  if (!animated && !staticAvatar) return null;
+  return {
+    avatarUrl: animated || staticAvatar,
+    avatarReducedUrl: animated ? staticAvatar : '',
+    frameUrl: frame,
+    frameReducedUrl: '',
+    personaName: typeof data.persona_name === 'string' ? Array.from(data.persona_name.trim()).slice(0, 80).join('') : ''
+  };
+}
+
+export function staticAvatarFallback(assets) {
+  if (!assets?.avatarReducedUrl || assets.avatarReducedUrl === assets.avatarUrl) return null;
+  return { ...assets, avatarUrl: assets.avatarReducedUrl, avatarReducedUrl: '' };
+}
+
+export function loadProfileAvatar({ directMini, backendMini, hedgeDelayMs = 350 }) {
+  return new Promise((resolve) => {
+    const failures = [];
+    const hasBackend = typeof backendMini === 'function';
+    let active = 0;
+    let backendStarted = false;
+    let finished = false;
+    let timer;
+
+    function finish(assets) {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      resolve({ assets, failures });
+    }
+
+    function startBackend() {
+      if (finished || backendStarted || !hasBackend) return;
+      backendStarted = true;
+      run('miniprofile', backendMini);
+    }
+
+    function run(label, request) {
+      active += 1;
+      Promise.resolve().then(request).then((body) => {
+        if (finished) return;
+        const assets = parseSteamMiniProfile(body);
+        if (assets) finish(assets);
+        else failures.push(`${label}：数据无有效头像`);
+      }, (error) => {
+        if (!finished) failures.push(`${label}：${error instanceof Error ? error.message : String(error)}`);
+      }).finally(() => {
+        active -= 1;
+        if (!finished && label === '前端直连' && hasBackend && !backendStarted) {
+          clearTimeout(timer);
+          startBackend();
+        }
+        if (!finished && active === 0 && (!hasBackend || backendStarted)) finish(null);
+      });
+    }
+
+    if (typeof directMini === 'function') {
+      run('前端直连', directMini);
+      if (hasBackend) timer = setTimeout(startBackend, hedgeDelayMs);
+    } else if (hasBackend) startBackend();
+    else finish(null);
+  });
+}
+
 // Steam's launch/terminate calls use the 64-bit non-Steam game ID, not the
 // 32-bit shortcut App ID returned by AddShortcut.
 export function gameIdFromAppId(appId) {
@@ -17,6 +101,19 @@ export function validateStatus(text) {
   return text.trim();
 }
 
+export function initialStatusText(config, shortcutIds, accountId) {
+  const profiles = Array.isArray(config?.Profiles) ? config.Profiles : [];
+  const selected = profiles.find((profile) => profile?.Id === config?.SelectedProfile) ?? profiles[0];
+  const fallback = typeof selected?.Text === 'string' ? selected.Text : '';
+  const recorded = shortcutIds?.[String(accountId)]?.name;
+  try { return validateStatus(recorded); }
+  catch { return fallback; }
+}
+
+export function hasUnsavedTemplateEdit(draft, baseline, templateText) {
+  return typeof templateText === 'string' && draft !== baseline && draft !== templateText;
+}
+
 export function changeTemplates(config, change) {
   const profiles = config?.Profiles;
   if (!Array.isArray(profiles) || profiles.length === 0) throw new Error('没有可用的状态模板。');
@@ -29,6 +126,9 @@ export function changeTemplates(config, change) {
   if (change.type === 'save') {
     if (index < 0) throw new Error('当前模板不存在。');
     const text = validateStatus(change.text);
+    if (profiles.some((profile) => profile.Id !== change.id && profile.Text === text)) {
+      throw new Error('已有相同文字的模板。');
+    }
     return {
       Profiles: profiles.map((profile) => profile.Id === change.id ? { ...profile, Text: text } : profile),
       SelectedProfile: change.id
@@ -37,8 +137,10 @@ export function changeTemplates(config, change) {
   if (change.type === 'add') {
     if (profiles.length >= 100) throw new Error('最多只能保存 100 个模板。');
     if (!change.id || profiles.some((profile) => profile.Id === change.id)) throw new Error('新模板 ID 无效。');
+    const text = validateStatus(change.text);
+    if (profiles.some((profile) => profile.Text === text)) throw new Error('已有相同文字的模板。');
     return {
-      Profiles: [...profiles, { Id: change.id, Text: validateStatus(change.text), CreatedAt: change.createdAt }],
+      Profiles: [...profiles, { Id: change.id, Text: text, CreatedAt: change.createdAt }],
       SelectedProfile: change.id
     };
   }
@@ -49,6 +151,33 @@ export function changeTemplates(config, change) {
     return { Profiles: remaining, SelectedProfile: remaining[Math.min(index, remaining.length - 1)].Id };
   }
   throw new Error('未知的模板操作。');
+}
+
+export function mergeManualCleanup(previous = [], current = []) {
+  function limitUtf8Bytes(value, limit) {
+    const encoder = new TextEncoder();
+    let result = '';
+    let bytes = 0;
+    for (const character of value) {
+      const size = encoder.encode(character).length;
+      if (bytes + size > limit) break;
+      result += character;
+      bytes += size;
+    }
+    return result;
+  }
+  const reports = new Map();
+  const entries = [...(Array.isArray(previous) ? previous : []), ...(Array.isArray(current) ? current : [])];
+  for (const item of entries) {
+    if (!item || typeof item.account !== 'string' || !item.account || item.account.length > 20) continue;
+    const reason = typeof item.reason === 'string' && item.reason ? limitUtf8Bytes(item.reason, 500) : '原因未知，请检查 Steam 库';
+    const id = Number.isInteger(item.id) && item.id >= 2147483648 && item.id <= 4294967295 ? item.id : undefined;
+    const name = typeof item.name === 'string' && item.name ? limitUtf8Bytes(item.name, 400) : undefined;
+    const report = { account: item.account, reason, ...(id === undefined ? {} : { id }), ...(name === undefined ? {} : { name }) };
+    const key = `${item.account}:${id === undefined ? reason : id}`;
+    reports.set(key, report);
+  }
+  return [...reports.values()];
 }
 
 export async function resetPluginState({ accountId, records, removeOwned, stopRunner, resetData }) {
@@ -75,7 +204,7 @@ export async function resetPluginState({ accountId, records, removeOwned, stopRu
   } catch (error) {
     manual.push({ account: accountId || '未知', reason: `后台进程未能停止，请从系统托盘手动退出：${error instanceof Error ? error.message : String(error)}` });
   }
-  const data = await resetData();
+  const data = await resetData(manual);
   return { data, manual };
 }
 
@@ -130,7 +259,7 @@ export function createStatusController({ apps, appStore, storage, runner, sleep 
   async function getOwned(accountId) {
     const record = await storage.get(accountId);
     if (!record) return null;
-    if (!Number.isInteger(record.id) || record.id < 2147483648 || typeof record.name !== 'string') {
+    if (!Number.isInteger(record.id) || record.id < 2147483648 || record.id > 4294967295 || typeof record.name !== 'string') {
       throw new Error('专用状态条目记录损坏；为避免误操作其他游戏，已停止。');
     }
     // A missing overview can also mean Steam has not finished loading its library.
@@ -194,6 +323,7 @@ export function createStatusController({ apps, appStore, storage, runner, sleep 
     } else {
       // A confirmed current runner with the same visible name needs no refresh.
       // Older records must still pass through migration away from PowerShell.
+      // Records from the removed rename-only experiment need one real refresh.
       if (record.name === name && record.runner === true && record.needsRefresh !== true && running(record.id) && await runnerActive()) return record;
       // Renaming a running shortcut can change Steam's overview before the
       // process is actually gone. Stop it while the old name/state is intact.
@@ -226,39 +356,29 @@ export function createStatusController({ apps, appStore, storage, runner, sleep 
       }
     }
 
-    await apps.RunGame(gameIdFromAppId(record.id), '', -1, 100);
-    await waitFor(() => running(record.id), '状态条目未启动；请检查 Steam 库中的该条目。', 60);
-    await waitFor(() => runnerActive(), '状态运行程序未能启动；请检查安装的 SteamStatusRunner.exe。', 60);
-    if (record.needsRefresh === true) {
-      record = { ...record, needsRefresh: false };
-      await storage.set(accountId, record);
-    }
-    return record;
-  }
-
-  async function renameOnly({ accountId, text }) {
-    const name = validateStatus(text);
-    requireApi('SetShortcutName');
-    const record = await getOwned(accountId);
-    if (!record || record.runner !== true || !running(record.id) || !await runnerActive()) {
-      throw new Error('专用状态条目尚未运行；请先使用“保存并应用”。');
-    }
-    if (record.name === name) return record;
-    await apps.SetShortcutName(record.id, name);
-    await waitFor(() => overview(record.id)?.display_name === name, 'Steam 未确认状态名称更新。');
-    const renamed = { ...record, name, needsRefresh: true };
     try {
-      await storage.set(accountId, renamed);
+      await apps.RunGame(gameIdFromAppId(record.id), '', -1, 100);
+      await waitFor(() => running(record.id), '状态条目未启动；请检查 Steam 库中的该条目。', 60);
+      await waitFor(() => runnerActive(), '状态运行程序未能启动；请检查安装的 SteamStatusRunner.exe。', 60);
     } catch (error) {
+      // RunGame may have partially succeeded. Do not leave this shortcut
+      // advertised as running after we report that Apply failed.
       try {
-        await apps.SetShortcutName(record.id, record.name);
-        await waitFor(() => overview(record.id)?.display_name === record.name, '无法恢复原状态名称。');
-      } catch {
-        throw new Error('状态名称已修改，但条目记录保存与回滚均失败；请勿操作其他游戏条目。');
+        ownedOverview(record);
+        if (running(record.id)) {
+          await apps.TerminateApp(gameIdFromAppId(record.id), false);
+          await waitFor(() => !running(record.id), 'Steam 未确认专用状态条目已停止。');
+        }
+      } catch (cleanupError) {
+        throw new Error(`${error instanceof Error ? error.message : String(error)}；自动停止专用条目失败：${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`);
       }
       throw error;
     }
-    return renamed;
+    if (record.needsRefresh === true) {
+      record = { id: record.id, name: record.name, runner: true };
+      await storage.set(accountId, record);
+    }
+    return record;
   }
 
   async function stop(accountId) {
@@ -280,5 +400,5 @@ export function createStatusController({ apps, appStore, storage, runner, sleep 
     return true;
   }
 
-  return { apply, renameOnly, stop, remove };
+  return { apply, stop, remove };
 }

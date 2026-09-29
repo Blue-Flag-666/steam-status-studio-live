@@ -20,6 +20,7 @@ coverage/
 /runner/*.exe
 /config.json
 /live-shortcuts.json
+/manual-cleanup.json
 *.steamstatus-live.bak
 *.steamstatus-live.corrupt.*
 SteamStatusRunner.heartbeat
