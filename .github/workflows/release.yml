@@ -47,7 +47,7 @@ jobs:
         run: bun test
 
       - name: Save release assets
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: github.event_name == 'push'
         uses: actions/upload-artifact@v4
         with:
           name: steam-status-studio-release
@@ -55,6 +55,29 @@ jobs:
             dist/com.steamstatusstudio.live.star
             dist/SteamStatusRunner.exe
           if-no-files-found: error
+          overwrite: true
+          retention-days: 7
+
+      - name: Download and check release assets
+        if: github.event_name == 'push'
+        uses: actions/download-artifact@v4
+        with:
+          name: steam-status-studio-release
+          path: downloaded
+
+      - name: Confirm downloaded assets match the build
+        if: github.event_name == 'push'
+        shell: pwsh
+        run: |
+          foreach ($name in @('com.steamstatusstudio.live.star', 'SteamStatusRunner.exe')) {
+            $built = Join-Path 'dist' $name
+            $downloaded = Join-Path 'downloaded' $name
+            if (-not (Test-Path -LiteralPath $downloaded -PathType Leaf)) { throw "Missing downloaded asset: $name" }
+            if ((Get-FileHash -LiteralPath $built -Algorithm SHA256).Hash -ne
+                (Get-FileHash -LiteralPath $downloaded -Algorithm SHA256).Hash) {
+              throw "Downloaded asset differs from the build: $name"
+            }
+          }
 
   release:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
