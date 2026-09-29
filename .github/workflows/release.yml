@@ -48,7 +48,7 @@ jobs:
 
       - name: Save release assets
         if: github.event_name == 'push'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: steam-status-studio-release
           path: |
@@ -60,7 +60,7 @@ jobs:
 
       - name: Download and check release assets
         if: github.event_name == 'push'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: steam-status-studio-release
           path: downloaded
@@ -86,7 +86,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: steam-status-studio-release
           path: dist
