@@ -1,5 +1,6 @@
 {
   "private": true,
+  "packageManager": "bun@1.4.2",
   "scripts": {
     "build": "bun run build:runner && starlight pack",
     "build:runner": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./build-runner.ps1",
