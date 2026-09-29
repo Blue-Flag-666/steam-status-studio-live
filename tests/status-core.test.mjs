@@ -385,6 +385,21 @@ test('a failed record write removes the newly-created shortcut', async () => {
   assert.equal(f.overviews.has(f.id), false);
 });
 
+test('failed cleanup after a record write error reports the orphaned shortcut ID', async () => {
+  const f = fake();
+  f.storage.set = async () => { throw new Error('disk full'); };
+  f.apps.RemoveShortcut = async (id) => { f.calls.push(['remove', id]); throw new Error('Steam refused deletion'); };
+  await assert.rejects(f.controller.apply(f.input), (error) => {
+    assert.match(error.message, /disk full/);
+    assert.match(error.message, /Steam refused deletion/);
+    assert.match(error.message, new RegExp(`App ID ${f.id}`));
+    return true;
+  });
+  assert.deepEqual(f.calls, [['add', '阅读中'], ['remove', f.id]]);
+  assert.equal(f.records.has('123'), false);
+  assert.equal(f.overviews.has(f.id), true);
+});
+
 test('a failed record write after rename restores the prior name', async () => {
   const f = fake();
   await f.controller.apply(f.input);

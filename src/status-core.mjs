@@ -308,8 +308,19 @@ export function createStatusController({ apps, appStore, storage, runner, sleep 
       } catch (error) {
         // This ID came directly from AddShortcut and has not been launched.
         // Do not strand an unrecorded shortcut if persistence fails.
+        let cleanupError = null;
         if (typeof apps.RemoveShortcut === 'function') {
-          try { await apps.RemoveShortcut(id); } catch { /* Preserve the storage failure. */ }
+          try {
+            await apps.RemoveShortcut(id);
+            await waitFor(() => !overview(id), 'Steam 未确认新条目已删除。');
+          } catch (failure) { cleanupError = failure; }
+        } else {
+          cleanupError = new Error('Steam 内部删除接口不可用');
+        }
+        if (cleanupError) {
+          const original = error instanceof Error ? error.message : String(error);
+          const cleanup = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
+          throw new Error(`条目记录保存失败：${original}；新条目可能残留（App ID ${id}），自动清理失败：${cleanup}。请核对 Steam 库并手动移除该 ID，不要删除其他同名游戏。`);
         }
         throw error;
       }
