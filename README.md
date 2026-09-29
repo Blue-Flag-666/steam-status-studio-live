@@ -2,12 +2,12 @@
 
 一个用于 Windows Steam 的 [Millennium](https://docs.steambrew.app/users/getting-started/installation) 插件，可在 Steam 内自定义好友看到的“正在玩”文字、保存模板并随时切换，无需重启 Steam。
 
-[下载最新版本](../../releases/latest)
+[下载最新版本](https://github.com/Blue-Flag-666/steam-status-studio-live/releases/latest)
 
 ## 安装
 
 1. 安装 [Millennium](https://docs.steambrew.app/users/getting-started/installation)。
-2. 从 [Releases](../../releases/latest) 下载 `com.steamstatusstudio.live.star` 和 `SteamStatusRunner.exe`。
+2. 从 [Releases](https://github.com/Blue-Flag-666/steam-status-studio-live/releases/latest) 下载 `com.steamstatusstudio.live.star` 和 `SteamStatusRunner.exe`。
 3. 将 `.star` 文件放入 `<Steam 安装目录>\millennium\plugins\`，将 `.exe` 文件放入 `%APPDATA%\SteamStatusStudio\runner\`。
 4. 重启 Steam，在 **Steam → Millennium → Plugins → Steam Status Studio Live → 配置** 中打开插件。
 
