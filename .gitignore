@@ -1,0 +1,27 @@
+.DS_Store
+Thumbs.db
+node_modules/
+.millennium/
+.build-tools/
+bun-windows-x64.zip
+dist/
+*.log
+*.tmp
+*.bak
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
+coverage/
+
+# Legacy build outputs and local account data
+/*.star
+/runner/*.exe
+/config.json
+/live-shortcuts.json
+*.steamstatus-live.bak
+*.steamstatus-live.corrupt.*
+SteamStatusRunner.heartbeat
+SteamStatusRunner.heartbeat.next
+SteamStatusRunner.stop

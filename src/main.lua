@@ -1,0 +1,235 @@
+local millennium = require("millennium")
+local logger = require("logger")
+-- Millennium exposes lua-cjson under the "json" preload name.
+local cjson = require("json")
+
+local appdata = os.getenv("APPDATA")
+local base = appdata and (appdata .. "\\SteamStatusStudio") or nil
+local config_path = base and (base .. "\\config.json") or nil
+local ids_path = base and (base .. "\\live-shortcuts.json") or nil
+local runner_path = base and (base .. "\\runner\\SteamStatusRunner.exe") or nil
+local heartbeat_path = base and (base .. "\\runner\\SteamStatusRunner.heartbeat") or nil
+local stop_path = base and (base .. "\\runner\\SteamStatusRunner.stop") or nil
+local write_sequence = 0
+
+local function read_file(path)
+    if not path then return nil end
+    local file = io.open(path, "rb")
+    if not file then return nil end
+    local data = file:read("*a")
+    file:close()
+    return data
+end
+
+local function decode_file(path, fallback)
+    local raw = read_file(path)
+    if not raw then
+        raw = read_file(path .. ".steamstatus-live.bak")
+        if not raw then return fallback end
+    end
+    local function decode(data)
+        data = data:gsub("^\239\187\191", "") -- Windows PowerShell 5.1 UTF-8 BOM
+        local ok, value = pcall(cjson.decode, data)
+        if ok and type(value) == "table" then return value end
+        return nil
+    end
+    local value = decode(raw)
+    if value then return value end
+    local backup = read_file(path .. ".steamstatus-live.bak")
+    if backup then
+        value = decode(backup)
+        if value then return value end
+    end
+    error("Cannot read " .. path .. ": invalid JSON (including backup)")
+end
+
+local function write_file(path, value)
+    if not path then error("APPDATA is unavailable") end
+    local temporary = path .. ".steamstatus-live.tmp"
+    local backup = path .. ".steamstatus-live.bak"
+    local encoded = cjson.encode(value)
+    local file = assert(io.open(temporary, "wb"))
+    assert(file:write(encoded))
+    assert(file:close())
+    local ok, decoded = pcall(cjson.decode, assert(read_file(temporary)))
+    if not ok or type(decoded) ~= "table" then error("Cannot validate " .. temporary) end
+
+    local old = read_file(path)
+    local previous_path = nil
+    if old then
+        local valid_old, old_value = pcall(cjson.decode, (old:gsub("^\239\187\191", "")))
+        if valid_old and type(old_value) == "table" then
+            local removed, message = os.remove(backup)
+            if not removed and read_file(backup) then
+                error("Cannot rotate backup " .. backup .. ": " .. tostring(message))
+            end
+            previous_path = backup
+        else
+            -- Keep both the valid backup and the damaged original recoverable.
+            write_sequence = write_sequence + 1
+            previous_path = path .. ".steamstatus-live.corrupt." .. os.time() .. "." .. write_sequence
+        end
+        -- A crash between renames is recovered by decode_file reading backup.
+        local moved, message = os.rename(path, previous_path)
+        if not moved then error("Cannot back up " .. path .. ": " .. tostring(message)) end
+    end
+    local moved, message = os.rename(temporary, path)
+    if not moved then
+        if previous_path then os.rename(previous_path, path) end
+        error("Cannot replace " .. path .. ": " .. tostring(message))
+    end
+end
+
+local function remove_if_present(path)
+    if not read_file(path) then return end
+    local removed, message = os.remove(path)
+    if not removed then error("Cannot remove " .. path .. ": " .. tostring(message)) end
+end
+
+local function default_config()
+    return {
+        Version = 1,
+        SelectedAccount = "",
+        SelectedProfile = "default",
+        Profiles = {{ Id = "default", Text = "Taking it easy", CreatedAt = "" }}
+    }
+end
+
+local function get_config()
+    local config = decode_file(config_path, default_config())
+    if type(config.Profiles) ~= "table" or #config.Profiles == 0 then
+        error("No usable status templates found in config.json")
+    end
+    return config
+end
+
+local function valid_text(value)
+    if type(value) ~= "string" or value:match("^%s*$") or value:find("[%z\1-\31]") then return false end
+    local count = 0
+    for i = 1, #value do
+        local byte = value:byte(i)
+        if byte < 128 or byte >= 192 then count = count + 1 end
+    end
+    return count <= 80
+end
+
+---@ffi
+---@return table
+function getBootstrap()
+    if not base then error("APPDATA is unavailable") end
+    return {
+        config = get_config(),
+        shortcutIds = decode_file(ids_path, {}),
+        runnerPath = runner_path,
+        runnerReady = read_file(runner_path) ~= nil,
+        executable = runner_path,
+        startDir = base .. "\\runner",
+        launchOptions = ""
+    }
+end
+
+---@ffi
+---@return boolean
+function isRunnerActive()
+    local heartbeat = read_file(heartbeat_path)
+    if not heartbeat then return false end
+    local pid, milliseconds = heartbeat:match("^(%d+):(%d+)$")
+    if not pid or not milliseconds then return false end
+    local age = math.abs(os.time() * 1000 - tonumber(milliseconds))
+    return age <= 4000
+end
+
+---@ffi
+---@return boolean
+function requestRunnerStop()
+    if not stop_path then error("APPDATA is unavailable") end
+    local file = assert(io.open(stop_path, "wb"))
+    assert(file:write("stop"))
+    assert(file:close())
+    return true
+end
+
+---@ffi
+---@param json string
+---@return table
+function saveTemplates(json)
+    if type(json) ~= "string" then error("Invalid template data") end
+    local ok, input = pcall(cjson.decode, json)
+    if not ok or type(input) ~= "table" or type(input.Profiles) ~= "table" then error("Invalid template JSON") end
+    if #input.Profiles < 1 or #input.Profiles > 100 then error("Keep between 1 and 100 templates") end
+    local selected_found = false
+    local seen = {}
+    for _, profile in ipairs(input.Profiles) do
+        if type(profile) ~= "table" or type(profile.Id) ~= "string" or
+           not profile.Id:match("^[%w%-]+$") or #profile.Id > 80 or
+           not valid_text(profile.Text) or seen[profile.Id] then
+            error("Invalid template ID or text")
+        end
+        seen[profile.Id] = true
+        if profile.Id == input.SelectedProfile then selected_found = true end
+    end
+    if not selected_found then error("Selected template does not exist") end
+    local current = get_config()
+    current.Profiles = input.Profiles
+    current.SelectedProfile = input.SelectedProfile
+    write_file(config_path, current)
+    return current
+end
+
+---@ffi
+---@param account_id string
+---@param app_id number
+---@param name string
+---@param runner boolean
+---@param needs_refresh boolean
+---@return boolean
+function setShortcutId(account_id, app_id, name, runner, needs_refresh)
+    account_id = tostring(account_id)
+    if not account_id:match("^%d+$") or type(app_id) ~= "number" or
+       app_id < 2147483648 or app_id > 4294967295 or app_id % 1 ~= 0 or
+       not valid_text(name) or type(runner) ~= "boolean" or type(needs_refresh) ~= "boolean" then
+        error("Invalid Steam account or shortcut ID")
+    end
+    local ids = decode_file(ids_path, {})
+    ids[account_id] = { id = app_id, name = name, runner = runner, needsRefresh = needs_refresh }
+    write_file(ids_path, ids)
+    return true
+end
+
+---@ffi
+---@param account_id string
+---@return boolean
+function clearShortcutId(account_id)
+    account_id = tostring(account_id)
+    if not account_id:match("^%d+$") then error("Invalid Steam account") end
+    local ids = decode_file(ids_path, {})
+    ids[account_id] = nil
+    write_file(ids_path, ids)
+    return true
+end
+
+---@ffi
+---@return table
+function resetPluginData()
+    if not base then error("APPDATA is unavailable") end
+    -- Reset the configuration first. If that write fails, shortcut IDs remain
+    -- available for a later retry or manual recovery.
+    local config = default_config()
+    local had_config = read_file(config_path) or read_file(config_path .. ".steamstatus-live.bak")
+    local had_ids = read_file(ids_path) or read_file(ids_path .. ".steamstatus-live.bak")
+    if had_config or had_ids then
+        write_file(config_path, config)
+        write_file(ids_path, {})
+        -- Old backups must not resurrect pre-reset templates or shortcut IDs.
+        remove_if_present(config_path .. ".steamstatus-live.bak")
+        remove_if_present(ids_path .. ".steamstatus-live.bak")
+    end
+    return { config = config, shortcutIds = {} }
+end
+
+local function on_load()
+    logger:info("Steam Status Studio Live backend loaded")
+    millennium.ready()
+end
+
+return { on_load = on_load }

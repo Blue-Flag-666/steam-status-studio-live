@@ -1,0 +1,59 @@
+name: Build and release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Check release version
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          $versionLine = Select-String -Path millennium.toml -Pattern '^version = "([^"]+)"$' | Select-Object -First 1
+          if (-not $versionLine -or $env:RELEASE_TAG -ne "v$($versionLine.Matches[0].Groups[1].Value)") {
+            throw "Tag $env:RELEASE_TAG must match the version in millennium.toml."
+          }
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build
+        run: bun run build
+
+      - name: Test
+        run: bun test
+
+      - name: Publish release assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          $assets = @('dist/com.steamstatusstudio.live.star', 'dist/SteamStatusRunner.exe')
+          foreach ($asset in $assets) {
+            if (-not (Test-Path -LiteralPath $asset -PathType Leaf)) { throw "Missing build artifact: $asset" }
+          }
+
+          $releaseJson = gh release view $env:RELEASE_TAG --json assets 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $env:RELEASE_TAG @assets --verify-tag --generate-notes --latest
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } else {
+            $existing = @((($releaseJson | ConvertFrom-Json).assets) | ForEach-Object { $_.name })
+            $missing = @($assets | Where-Object { [IO.Path]::GetFileName($_) -notin $existing })
+            if ($missing.Count -gt 0) {
+              gh release upload $env:RELEASE_TAG @missing
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            }
+          }

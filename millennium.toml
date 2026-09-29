@@ -1,0 +1,16 @@
+[plugin]
+id = "com.steamstatusstudio.live"
+name = "Steam Status Studio Live"
+version = "1.0.0"
+author = "Steam Status Studio"
+description = "Change a dedicated non-Steam playing status without restarting Steam."
+
+[backend]
+entry = "src/main.lua"
+sources = ["src/main.lua"]
+
+[frontend]
+entry = "src/index.tsx"
+
+[compiler]
+output_path = "dist/com.steamstatusstudio.live.star"
