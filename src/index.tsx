@@ -12,6 +12,7 @@ declare const backend: {
   isRunnerActive(): Promise<boolean>;
   requestRunnerStop(): Promise<boolean>;
   resetPluginData(manualJson: string): Promise<{ config: Config; shortcutIds: { [account: string]: ShortcutRecord }; manualCleanup: ManualCleanup[] }>;
+  addManualCleanup(itemJson: string): Promise<ManualCleanup[]>;
   clearManualCleanup(): Promise<boolean>;
 };
 
@@ -251,7 +252,20 @@ function SettingsContent() {
       await action();
       setNotice({ kind: 'success', text: `${label}完成。` });
     } catch (error) {
-      setNotice({ kind: 'error', text: `${label}失败：${error instanceof Error ? error.message : String(error)}` });
+      let detail = error instanceof Error ? error.message : String(error);
+      const report = error instanceof Error ? (error as Error & { manualCleanup?: ManualCleanup }).manualCleanup : undefined;
+      if (report) {
+        setManualCleanup((current) => mergeManualCleanup(current, [report]));
+        try {
+          const saved = await backend.addManualCleanup(JSON.stringify(report));
+          setManualCleanup((current) => mergeManualCleanup(current, saved));
+        } catch {
+          const volatileReport = { ...report, reason: `${report.reason}（提醒未能写入磁盘；关闭页面前请记录 App ID）` };
+          setManualCleanup((current) => mergeManualCleanup(current, [volatileReport]));
+          detail += '；手动清理提醒未能保存，请先记录 App ID。';
+        }
+      }
+      setNotice({ kind: 'error', text: `${label}失败：${detail}` });
     } finally {
       setBusy(false);
     }

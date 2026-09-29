@@ -260,6 +260,37 @@ function clearShortcutId(account_id)
     return true
 end
 
+local function valid_cleanup_item(item)
+    return type(item) == "table" and type(item.account) == "string" and
+           #item.account <= 20 and type(item.reason) == "string" and
+           #item.reason <= 500 and
+           (item.id == nil or (type(item.id) == "number" and item.id % 1 == 0)) and
+           (item.name == nil or (type(item.name) == "string" and #item.name <= 400))
+end
+
+---@ffi
+---@param item_json string
+---@return table
+function addManualCleanup(item_json)
+    if not base then error("APPDATA is unavailable") end
+    if type(item_json) ~= "string" then error("Invalid cleanup report") end
+    local ok, item = pcall(cjson.decode, item_json)
+    if not ok or not valid_cleanup_item(item) or item.id == nil then error("Invalid cleanup report") end
+    local manual = decode_file(cleanup_path, {})
+    if type(manual) ~= "table" or #manual > 100 then error("Invalid existing cleanup report") end
+    for index, existing in ipairs(manual) do
+        if existing.account == item.account and existing.id == item.id then
+            manual[index] = item
+            write_file(cleanup_path, manual)
+            return manual
+        end
+    end
+    if #manual >= 100 then error("Too many cleanup reports") end
+    manual[#manual + 1] = item
+    write_file(cleanup_path, manual)
+    return manual
+end
+
 ---@ffi
 ---@param manual_json string
 ---@return table
@@ -271,13 +302,7 @@ function resetPluginData(manual_json)
         error("Invalid cleanup report")
     end
     for _, item in ipairs(manual) do
-        if type(item) ~= "table" or type(item.account) ~= "string" or
-           #item.account > 20 or type(item.reason) ~= "string" or
-           #item.reason > 500 or
-           (item.id ~= nil and (type(item.id) ~= "number" or item.id % 1 ~= 0)) or
-           (item.name ~= nil and (type(item.name) ~= "string" or #item.name > 400)) then
-            error("Invalid cleanup report")
-        end
+        if not valid_cleanup_item(item) then error("Invalid cleanup report") end
     end
     -- Preserve unresolved manual cleanup guidance before shortcut IDs vanish.
     write_file(cleanup_path, manual)

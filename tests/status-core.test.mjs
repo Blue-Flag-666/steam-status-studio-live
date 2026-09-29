@@ -393,6 +393,10 @@ test('failed cleanup after a record write error reports the orphaned shortcut ID
     assert.match(error.message, /disk full/);
     assert.match(error.message, /Steam refused deletion/);
     assert.match(error.message, new RegExp(`App ID ${f.id}`));
+    assert.deepEqual(error.manualCleanup, {
+      account: '123', id: f.id, name: '阅读中',
+      reason: '条目创建后记录保存失败，且 Steam 未确认自动删除；请核对并手动移除。'
+    });
     return true;
   });
   assert.deepEqual(f.calls, [['add', '阅读中'], ['remove', f.id]]);

@@ -320,7 +320,12 @@ export function createStatusController({ apps, appStore, storage, runner, sleep 
         if (cleanupError) {
           const original = error instanceof Error ? error.message : String(error);
           const cleanup = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
-          throw new Error(`条目记录保存失败：${original}；新条目可能残留（App ID ${id}），自动清理失败：${cleanup}。请核对 Steam 库并手动移除该 ID，不要删除其他同名游戏。`);
+          const failure = new Error(`条目记录保存失败：${original}；新条目可能残留（App ID ${id}），自动清理失败：${cleanup}。请核对 Steam 库并手动移除该 ID，不要删除其他同名游戏。`);
+          failure.manualCleanup = {
+            account: String(accountId), id, name,
+            reason: '条目创建后记录保存失败，且 Steam 未确认自动删除；请核对并手动移除。'
+          };
+          throw failure;
         }
         throw error;
       }
