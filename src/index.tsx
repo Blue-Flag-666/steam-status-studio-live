@@ -1,9 +1,10 @@
 import { useEffect, useState } from 'react';
 import { definePlugin } from 'millennium';
-import { changeTemplates, createStatusController, hasUnsavedTemplateEdit, initialStatusText, loadProfileAvatar, mergeManualCleanup, resetPluginState, staticAvatarFallback, validateStatus } from './status-core.mjs';
+import { changeTemplates, createStatusController, hasUnsavedTemplateEdit, initialStatusText, loadProfileAvatar, mergeManualCleanup, recoveryManualCleanup, resetPluginState, staticAvatarFallback, validateStatus } from './status-core.mjs';
 
 declare const backend: {
   getBootstrap(): Promise<Bootstrap>;
+  getRecoveryInfo(): Promise<RecoveryInfo>;
   getPublicMiniProfile(accountId: string): Promise<string>;
   saveTemplates(json: string): Promise<Config>;
   getShortcutId(account: string): Promise<ShortcutRecord | null>;
@@ -29,6 +30,7 @@ type Bootstrap = {
   startDir: string;
   launchOptions: string;
 };
+type RecoveryInfo = { shortcutIds?: { [account: string]: ShortcutRecord }; manualCleanup?: ManualCleanup[]; cleanupUnreadable?: boolean };
 type Notice = { kind: 'info' | 'success' | 'error'; text: string; inProgress?: boolean };
 type ManualCleanup = { account: string; id?: number; name?: string; reason?: string };
 type ProfileAvatar = { avatarUrl: string; avatarReducedUrl: string; frameUrl: string; frameReducedUrl: string; personaName: string };
@@ -96,6 +98,7 @@ const css = `
 
 function SettingsContent() {
   const [bootstrap, setBootstrap] = useState<Bootstrap | null>(null);
+  const [bootstrapError, setBootstrapError] = useState('');
   const [account, setAccount] = useState('');
   const [selected, setSelected] = useState('');
   const [draft, setDraft] = useState('');
@@ -144,6 +147,7 @@ function SettingsContent() {
         if (mounted) setAccount(String(accountId));
         const data = await backend.getBootstrap();
         if (!mounted) return;
+        setBootstrapError('');
         const initial = data.config.Profiles.find((item) => item.Id === data.config.SelectedProfile) ?? data.config.Profiles[0];
         if (!initial) throw new Error('配置中没有可用的状态模板。');
         setBootstrap(data);
@@ -154,7 +158,10 @@ function SettingsContent() {
         setManualCleanup(mergeManualCleanup(data.manualCleanup, []));
         if (!data.runnerReady) setNotice({ kind: 'error', text: '运行程序未安装。请按 README 安装 SteamStatusRunner.exe 后重新打开此页。' });
       } catch (error) {
-        if (mounted) setNotice({ kind: 'error', text: `加载失败：${String(error)}` });
+        if (mounted) {
+          setBootstrapError(error instanceof Error ? error.message : String(error));
+          setNotice({ kind: 'error', text: `加载失败：${String(error)}` });
+        }
       }
     })();
     return () => { mounted = false; };
@@ -218,7 +225,7 @@ function SettingsContent() {
   }, [account]);
 
   function controller() {
-    if (!bootstrap || !account) throw new Error('插件尚未初始化。');
+    if (!account) throw new Error('无法确定当前 Steam 账号。');
     const steam = (window as any).SteamClient;
     const appStore = (window as any).appStore;
     return createStatusController({
@@ -228,17 +235,19 @@ function SettingsContent() {
       storage: {
         get: async (key: string) => {
           const record = await backend.getShortcutId(key);
-          if (record) bootstrap.shortcutIds[key] = record;
-          else delete bootstrap.shortcutIds[key];
+          if (bootstrap) {
+            if (record) bootstrap.shortcutIds[key] = record;
+            else delete bootstrap.shortcutIds[key];
+          }
           return record;
         },
         set: async (key: string, record: ShortcutRecord) => {
           await backend.setShortcutId(key, record.id, record.name, record.runner === true);
-          bootstrap.shortcutIds[key] = record;
+          if (bootstrap) bootstrap.shortcutIds[key] = record;
         },
         clear: async (key: string) => {
           await backend.clearShortcutId(key);
-          delete bootstrap.shortcutIds[key];
+          if (bootstrap) delete bootstrap.shortcutIds[key];
         }
       }
     });
@@ -342,15 +351,12 @@ function SettingsContent() {
 
   async function resetPlugin() {
     if (busy) return;
-    if (bootstrap?.persistentCleanup !== true) {
-      setNotice({ kind: 'error', text: '当前后端尚未加载新版插件，暂不能安全重置；请在下次正常启动 Steam 后再试。' });
-      setConfirmReset(false);
-      return;
-    }
     setBusy(true);
     setNotice({ kind: 'info', text: '正在重置插件…', inProgress: true });
     try {
-      const latest = await backend.getBootstrap();
+      // Read shortcut records independently of config.json, which may be the
+      // damaged file that made the regular settings page unusable.
+      const latest = await backend.getRecoveryInfo();
       const { manual } = await resetPluginState({
         accountId: account,
         records: latest.shortcutIds,
@@ -364,10 +370,13 @@ function SettingsContent() {
           }
           throw new Error('退出请求超时');
         },
-        resetData: (freshManual: ManualCleanup[]) => backend.resetPluginData(JSON.stringify(mergeManualCleanup(manualCleanup, freshManual)))
+        resetData: (freshManual: ManualCleanup[]) => backend.resetPluginData(JSON.stringify(
+          recoveryManualCleanup(manualCleanup, latest.manualCleanup, freshManual, latest.cleanupUnreadable, account)
+        ))
       });
       const data = await backend.getBootstrap();
       setBootstrap(data);
+      setBootstrapError('');
       const unresolved = mergeManualCleanup(data.manualCleanup, manual);
       setManualCleanup(unresolved);
       setSelected(data.config.SelectedProfile);
@@ -394,6 +403,10 @@ function SettingsContent() {
       <div><p className="sss-eyebrow">Steam Status Studio</p><h2>自定义状态</h2></div>
       <span className="sss-account" title={account ? `当前账号：${account}` : '未检测到账号'}>账号 {account || '未检测到'}</span>
     </header>
+    {bootstrapError && <div className="sss-confirm" role="alert">
+      <strong>插件未能加载</strong><p>{bootstrapError}</p>
+      <p>如果是插件数据损坏，可在页面下方的高级操作中尝试完全重置。</p>
+    </div>}
 
     <section className="sss-card" aria-labelledby="sss-status-title">
       <div className="sss-card-head"><h3 id="sss-status-title">状态文字</h3><span className="sss-muted">最多 80 字</span></div>
@@ -499,11 +512,8 @@ function SettingsContent() {
         </div>}
     </div>}
     <details className="sss-advanced"><summary>高级操作 · 重置插件</summary>
-      <p>重置会清空全部模板和快捷方式记录，并尝试停止、移除当前账号的专用状态条目。其他账号的条目无法在当前账号下安全删除，须手动处理。</p>
-      {!confirmReset ? <button type="button" className="sss-button sss-danger" disabled={busy} onClick={() => {
-        if (bootstrap?.persistentCleanup !== true) setNotice({ kind: 'error', text: '当前后端尚未加载新版插件，暂不能安全重置；请在下次正常启动 Steam 后再试。' });
-        else setConfirmReset(true);
-      }}>完全重置插件…</button> :
+      <p>重置会清空全部模板和快捷方式记录，并尝试停止、移除当前账号的专用状态条目。其他账号的条目无法在当前账号下安全删除，须手动处理。若当前账号无法识别，也不会自动删除任何条目。</p>
+      {!confirmReset ? <button type="button" className="sss-button sss-danger" disabled={busy} onClick={() => setConfirmReset(true)}>完全重置插件…</button> :
         <div className="sss-confirm">确认重置全部模板和记录？此操作不能通过插件撤销。若自动删除条目失败，重置后会显示手动删除提示。
           <div className="sss-actions">
             <button type="button" className="sss-button sss-danger" disabled={busy} onClick={() => void resetPlugin()}>确认完全重置</button>

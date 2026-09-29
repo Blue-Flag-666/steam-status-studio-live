@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { changeTemplates, createStatusController, gameIdFromAppId, hasUnsavedTemplateEdit, initialStatusText, loadProfileAvatar, mergeManualCleanup, parseSteamMiniProfile, resetPluginState, staticAvatarFallback, validateStatus } from '../src/status-core.mjs';
+import { changeTemplates, createStatusController, gameIdFromAppId, hasUnsavedTemplateEdit, initialStatusText, loadProfileAvatar, mergeManualCleanup, parseSteamMiniProfile, recoveryManualCleanup, resetPluginState, staticAvatarFallback, validateStatus } from '../src/status-core.mjs';
 
 test('Steam miniprofile provides animated avatar, frame, static fallback and nickname', () => {
   const data = JSON.stringify({
@@ -466,6 +466,20 @@ test('manual cleanup reports survive later resets without accumulating duplicate
   assert.ok(!unicode.reason.includes('\ufffd'));
 });
 
+test('recovery reset preserves saved, current and new cleanup reports when settings are damaged', () => {
+  const current = [{ account: '123', id: 3500000000, reason: '旧提醒' }];
+  const saved = [
+    { account: '123', id: 3500000000, reason: '更新后的提醒' },
+    { account: '456', id: 3600000000, reason: '其他账号' }
+  ];
+  const fresh = [{ account: '789', id: 3700000000, reason: '本次重置发现' }];
+  assert.deepEqual(recoveryManualCleanup(current, saved, fresh, true, '123'), [
+    saved[0], saved[1], fresh[0],
+    { account: '123', reason: '原有手动清理提醒文件无法读取；请检查 Steam 库' }
+  ]);
+  assert.deepEqual(recoveryManualCleanup([], {}, [], false, ''), []);
+});
+
 test('full reset removes only the current account shortcut before clearing plugin data', async () => {
   const calls = [];
   const result = await resetPluginState({
@@ -478,6 +492,18 @@ test('full reset removes only the current account shortcut before clearing plugi
   const expectedManual = [{ account: '456', id: 3600000000, name: '另一账号', reason: '请切换到此账号后手动删除' }];
   assert.deepEqual(calls, [['remove', '123'], ['stop-runner'], ['reset-data', expectedManual]]);
   assert.deepEqual(result.manual, expectedManual);
+});
+
+test('reset with an unknown account leaves every recorded shortcut for manual review', async () => {
+  const calls = [];
+  const result = await resetPluginState({
+    accountId: '', records: { '123': { id: 3500000000, name: '我的状态' } },
+    removeOwned: async () => { calls.push('remove'); },
+    stopRunner: async () => { calls.push('stop-runner'); },
+    resetData: async () => { calls.push('reset-data'); return {}; }
+  });
+  assert.deepEqual(calls, ['stop-runner', 'reset-data']);
+  assert.deepEqual(result.manual, [{ account: '123', id: 3500000000, name: '我的状态', reason: '当前账号无法确认，请核对后手动删除' }]);
 });
 
 test('full reset still clears plugin data and reports manual cleanup when shortcut deletion fails', async () => {

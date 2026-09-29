@@ -154,6 +154,19 @@ end
 
 ---@ffi
 ---@return table
+function getRecoveryInfo()
+    if not base then error("APPDATA is unavailable") end
+    local ids_ok, ids = pcall(decode_file, ids_path, {})
+    local manual_ok, manual = pcall(decode_file, cleanup_path, {})
+    return {
+        shortcutIds = ids_ok and ids or nil,
+        manualCleanup = manual_ok and manual or {},
+        cleanupUnreadable = not manual_ok
+    }
+end
+
+---@ffi
+---@return table
 function getBootstrap()
     if not base then error("APPDATA is unavailable") end
     return {

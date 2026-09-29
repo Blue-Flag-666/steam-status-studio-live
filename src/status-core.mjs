@@ -180,11 +180,19 @@ export function mergeManualCleanup(previous = [], current = []) {
   return [...reports.values()];
 }
 
+export function recoveryManualCleanup(current, saved, fresh, unreadable, accountId) {
+  const unknown = unreadable
+    ? [{ account: accountId || '未知', reason: '原有手动清理提醒文件无法读取；请检查 Steam 库' }]
+    : [];
+  return mergeManualCleanup(mergeManualCleanup(current, saved), [...fresh, ...unknown]);
+}
+
 export async function resetPluginState({ accountId, records, removeOwned, stopRunner, resetData }) {
   const manual = [];
   if (records && typeof records === 'object') {
     for (const [key, record] of Object.entries(records)) {
-      if (key !== accountId) manual.push({ account: key, id: record?.id, name: record?.name, reason: '请切换到此账号后手动删除' });
+      if (key !== accountId) manual.push({ account: key, id: record?.id, name: record?.name,
+        reason: accountId ? '请切换到此账号后手动删除' : '当前账号无法确认，请核对后手动删除' });
     }
     if (accountId && Object.prototype.hasOwnProperty.call(records, accountId)) {
       const record = records[accountId];
